@@ -20,7 +20,7 @@ from app.auth import (
     TOKEN_EXPIRE_MINUTES,
 )
 from app.logging_config import setup_logging
-from middleware import LoggingMiddleware
+from app.middleware import LoggingMiddleware
 from app.metrics import(
     PREDICTIONS_TOTAL,
     LOGIN_ATTEMPTS,

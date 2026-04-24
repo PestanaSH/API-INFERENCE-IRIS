@@ -4,36 +4,41 @@ Pronta para deploy em container/cloud
 """
 import os
 import pickle
-import logging
+import time
 from pathlib import Path
-
 import numpy as np
-from fastapi import Depends, FastAPI, HTTPException
+
+from fastapi import Depends, FastAPI, HTTPException, Request
 from pydantic import BaseModel, Field
 
-# Importa funcoes do modulo auth
+from prometheus_fastapi_instrumentator import Instrumentator
+
 from app.auth import (
     create_token,
     get_current_user,
     authenticate_user,
     TOKEN_EXPIRE_MINUTES,
 )
-
+from app.logging_config import setup_logging
+from middleware import LoggingMiddleware
+from app.metrics import(
+    PREDICTIONS_TOTAL,
+    LOGIN_ATTEMPTS,
+    PREDICTION_LATENCY,
+    MODEL_LOADED,
+)
 
 # =============================================================================
-# CONFIGURACOES
+# CONFIGS
 # =============================================================================
 ENVIRONMENT = os.getenv("ENVIRONMENT", "development")
+API_VERSION = "2.1.0"
 
 
 # =============================================================================
 # LOGGING
 # =============================================================================
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s | %(levelname)s | %(message)s"
-)
-logger = logging.getLogger(__name__)
+logger = setup_logging(os.getenv("LOG_LEVEL", "INFO"))
 
 
 # =============================================================================
@@ -89,71 +94,99 @@ for model_path in MODEL_PATHS:
         break
 
 MODELO_OK = modelo is not None and classes is not None
+
+MODEL_LOADED.set(1 if MODELO_OK else 0)
+
 if not MODELO_OK:
-    logger.warning("Modelo NAO encontrado! API funcionara sem predicao.")
+    logger.warning("model_not_found", extra={"searched_paths": [str(p) for p in MODEL_PATHS]})
 
 
 # =============================================================================
-# APLICACAO FASTAPI
+# FASTAPI APP
 # =============================================================================
 app = FastAPI(
-    title="API Iris com JWT",
-    description="API de classificacao de flores Iris com autenticacao JWT. Deploy em producao.",
-    version="2.0.0",
+    title="API Iris With Monitoring",
+    description="Classification API with structured logs and Prometheus metrics",
+    version=API_VERSION,
     docs_url="/docs",
-    redoc_url="/redoc"
+    redoc_url="/redoc",
+    redoc_js_url="https://cdn.jsdelivr.net/npm/redoc@2/bundles/redoc.standalone.js"
 )
+
+app.add_middleware(LoggingMiddleware)
+
+Instrumentator().instrument(app).expose(app, endpoint="/metrics")
 
 
 @app.get("/")
 def home():
-    """Informacoes da API."""
+    """API Informations"""
     return {
         "api": "Iris Classifier",
-        "versao": "2.0.0",
+        "versao": API_VERSION,
         "ambiente": ENVIRONMENT,
         "modelo_carregado": MODELO_OK,
         "docs": "/docs",
-        
+        "metrics": "/metrics",
+        "health": "/health",
     }
 
 
 @app.get("/health")
 def health():
-    """Health check para monitoramento."""
+    """Health check"""
     return {
         "status": "healthy" if MODELO_OK else "degraded",
         "modelo": MODELO_OK,
         "ambiente": ENVIRONMENT,
+        "version": API_VERSION,
     }
 
 
 @app.post("/login", response_model=TokenResponse)
-def login(credentials: LoginRequest):
-    """Faz login e retorna token JWT."""
+def login(credentials: LoginRequest, request: Request):
+    """Make login and retorn JWT token."""
     user = authenticate_user(credentials.username, credentials.password)
-    
-    if not user:
-        logger.warning(f"Login falhou para: {credentials.username}")
-        raise HTTPException(status_code=401, detail="Usuario ou senha incorretos")
-    
-    token = create_token(user["username"], user["role"])
-    logger.info(f"Login bem-sucedido: {user['username']}")
-    return TokenResponse(access_token=token, expires_in=TOKEN_EXPIRE_MINUTES * 60)
+    trace_id = getattr(request.state, 'trace_id', 'N/A')
 
+    if not user:
+        LOGIN_ATTEMPTS.labels(status="failed").inc()
+
+        logger.warning("login_failed", extra={
+            "username": credentials.username,
+            "trace_id": trace_id, 
+        })
+        raise HTTPException(status_code=401, detail="Usuario ou senha incorretos")
+
+    LOGIN_ATTEMPTS.labels(status="success").inc()
+
+    token = create_token(user["username"], user["role"])
+
+    logger.info("login_success", extra={
+        "username": user["username"],
+        "role": user["role"],
+        "trace_id": trace_id,
+    })
+
+    return TokenResponse(access_token=token, expires_in=TOKEN_EXPIRE_MINUTES * 60)
 
 @app.get("/me")
 def get_me(current_user: dict = Depends(get_current_user)):
-    """Retorna informacoes do usuario logado."""
     return current_user
 
 
 @app.post("/predict", response_model=IrisResponse)
-def predict(payload: IrisRequest, current_user: dict = Depends(get_current_user)):
-    """Faz predicao (requer autenticacao)."""
+def predict(payload: IrisRequest, request: Request, current_user: dict = Depends(get_current_user)):
+ 
     if not MODELO_OK:
         raise HTTPException(status_code=503, detail="Modelo nao disponivel")
     
+    trace_id = getattr(request.state, 'trace_id', 'N/A')
+
+
+    # Measures prediction latency
+    start = time.perf_counter()
+
     features = np.array([[
         payload.sepal_length, payload.sepal_width,
         payload.petal_length, payload.petal_width
@@ -162,8 +195,26 @@ def predict(payload: IrisRequest, current_user: dict = Depends(get_current_user)
     pred_idx = modelo.predict(features)[0]
     probs = modelo.predict_proba(features)[0]
     classe = classes[pred_idx]
+    confidence = float(max(probs))
+
+    latency = time.perf_counter() - start
     
-    logger.info(f"Predicao: {classe} por {current_user['username']}")
+    PREDICTIONS_TOTAL.labels(classe=classe, user=current_user["username"]).inc()
+    PREDICTION_LATENCY.observe(latency)
+
+    logger.info("prediction_completed", extra={
+        "trace_id": trace_id,
+        "user": current_user["username"], 
+        "classe": classe,
+        "confidence": round(confidence, 4),
+        "latency_ms": round(latency * 1000, 2),
+        "features": {
+            "sepal_length": payload.sepal_length,
+            "sepal_width": payload.sepal_width,
+            "petal_length": payload.petal_length,
+            "petal_width": payload.petal_width,
+        }
+    })
     
     return IrisResponse(
         sucesso=True,

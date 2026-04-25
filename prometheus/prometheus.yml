@@ -5,10 +5,10 @@
 
 global:
   # Intervalo de coleta (scrape)
-  scrape_interval: 15s
+  scrape_interval: 1s
   
   # Intervalo de avaliacao de alertas
-  evaluation_interval: 15s
+  evaluation_interval: 1s
 
 # Arquivos de regras de alerta
 rule_files:
